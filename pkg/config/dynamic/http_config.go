@@ -185,6 +185,7 @@ type HealthCheck struct {
 	Hostname        string            `json:"hostname,omitempty" toml:"hostname,omitempty" yaml:"hostname,omitempty"`
 	FollowRedirects *bool             `json:"followRedirects" toml:"followRedirects" yaml:"followRedirects"`
 	Headers         map[string]string `json:"headers,omitempty" toml:"headers,omitempty" yaml:"headers,omitempty"`
+	Service         string            `json:"service,omitempty" toml:"service,omitempty" yaml:"service,omitempty"`
 }
 
 // SetDefaults Default values for a HealthCheck.

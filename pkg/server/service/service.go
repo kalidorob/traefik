@@ -283,6 +283,7 @@ func buildHealthCheckOptions(ctx context.Context, lb healthcheck.Balancer, backe
 		Hostname:        hc.Hostname,
 		Headers:         hc.Headers,
 		FollowRedirects: followRedirects,
+		Service:         hc.Service,
 	}
 }
 
