@@ -2,6 +2,7 @@ package healthcheck
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"github.com/containous/traefik/v2/pkg/safe"
 	"github.com/go-kit/kit/metrics"
 	"github.com/vulcand/oxy/roundrobin"
+	grpcLib "google.golang.org/grpc"
+	grpcHealth "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 const (
@@ -57,10 +60,11 @@ type Options struct {
 	Interval        time.Duration
 	Timeout         time.Duration
 	LB              Balancer
+	Service         string
 }
 
 func (opt Options) String() string {
-	return fmt.Sprintf("[Hostname: %s Headers: %v Path: %s Port: %d Interval: %s Timeout: %s FollowRedirects: %v]", opt.Hostname, opt.Headers, opt.Path, opt.Port, opt.Interval, opt.Timeout, opt.FollowRedirects)
+	return fmt.Sprintf("[Hostname: %s Headers: %v Path: %s Port: %d Interval: %s Timeout: %s FollowRedirects: %v Service: %s]", opt.Hostname, opt.Headers, opt.Path, opt.Port, opt.Interval, opt.Timeout, opt.FollowRedirects, opt.Service)
 }
 
 type backendURL struct {
@@ -73,6 +77,10 @@ type BackendConfig struct {
 	Options
 	name         string
 	disabledURLs []backendURL
+}
+
+func (b *BackendConfig) newHostPort(serverURL *url.URL) (string, error) {
+	return serverURL.Host, nil
 }
 
 func (b *BackendConfig) newRequest(serverURL *url.URL) (*http.Request, error) {
@@ -153,7 +161,7 @@ func (hc *HealthCheck) checkBackend(ctx context.Context, backend *BackendConfig)
 	enabledURLs := backend.LB.Servers()
 	var newDisabledURLs []backendURL
 	for _, disabledURL := range backend.disabledURLs {
-		if err := checkHealth(disabledURL.url, backend); err == nil {
+		if err := hc.checkHealth(disabledURL.url, backend); err == nil {
 			logger.Warnf("Health check up: Returning to server list. Backend: %q URL: %q Weight: %d",
 				backend.name, disabledURL.url.String(), disabledURL.weight)
 			if err = backend.LB.UpsertServer(disabledURL.url, roundrobin.Weight(disabledURL.weight)); err != nil {
@@ -167,7 +175,7 @@ func (hc *HealthCheck) checkBackend(ctx context.Context, backend *BackendConfig)
 	backend.disabledURLs = newDisabledURLs
 
 	for _, enableURL := range enabledURLs {
-		if err := checkHealth(enableURL, backend); err != nil {
+		if err := hc.checkHealth(enableURL, backend); err != nil {
 			weight := 1
 			rr, ok := backend.LB.(*roundrobin.RoundRobin)
 			if ok {
@@ -210,7 +218,59 @@ func NewBackendConfig(options Options, backendName string) *BackendConfig {
 
 // checkHealth returns a nil error in case it was successful and otherwise
 // a non-nil error with a meaningful description why the health check failed.
-func checkHealth(serverURL *url.URL, backend *BackendConfig) error {
+func (hc *HealthCheck) checkHealth(serverURL *url.URL, backend *BackendConfig) error {
+	u, err := serverURL.Parse("/")
+	if err != nil {
+		return err
+	}
+
+	if backend.Options.Service != "" || (u.Scheme == "h2c" && backend.Path == "/grpc.health.v1.Health/Check") {
+		return checkHealthGRPC(serverURL, backend)
+	}
+
+	return checkHealthHTTP(serverURL, backend)
+}
+
+// checkHealthGRPC returns a nil error in case it was successful and otherwise
+// a non-nil error with a meaningful description why the health check failed.
+func checkHealthGRPC(serverURL *url.URL, backend *BackendConfig) error {
+	addr, err := backend.newHostPort(serverURL)
+	if err != nil {
+		return fmt.Errorf("failed to create GRPC address: %w", err)
+	}
+
+	opts := []grpcLib.DialOption{grpcLib.WithInsecure()}
+
+	conn, err := grpcLib.Dial(addr, opts...)
+	if err != nil {
+		return err
+	}
+	// Make sure we don't leak any fds.
+	defer conn.Close()
+
+	client := grpcHealth.NewHealthClient(conn)
+
+	req := &grpcHealth.HealthCheckRequest{Service: ""}
+
+	if backend.Options.Service != "" {
+		req.Service = backend.Options.Service
+	}
+
+	x, err := client.Check(context.Background(), req)
+	if err != nil {
+		return err
+	}
+
+	if x.Status != grpcHealth.HealthCheckResponse_SERVING {
+		return errors.New("not serving")
+	}
+
+	return nil
+}
+
+// checkHealthHTTP returns a nil error in case it was successful and otherwise
+// a non-nil error with a meaningful description why the health check failed.
+func checkHealthHTTP(serverURL *url.URL, backend *BackendConfig) error {
 	req, err := backend.newRequest(serverURL)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
